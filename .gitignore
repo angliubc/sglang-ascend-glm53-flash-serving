@@ -1,0 +1,8 @@
+# port-source trees consumed by scripts/glm5_next_port_builder.py (huge, external)
+lmsysorg/
+daily/
+port/
+
+# python
+__pycache__/
+*.pyc

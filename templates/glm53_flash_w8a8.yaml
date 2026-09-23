@@ -1,0 +1,54 @@
+# GLM-5.3-Flash (glm5_next) W8A8 — modelslim_v1 declarative yaml
+#
+# WHY THIS EXISTS: msmodelslim llm_ptq (AntiOutlier/Calibrator path) wraps only
+# nn.Linear. glm5_next's fused experts (Glm5NextTextExperts, gate_up_proj =
+# raw 3-D nn.Parameter [288, 2*I, H]) are NOT nn.Linear -> silently skipped,
+# EXIT=0, artifact 578GB with 608.8GB experts still BF16 (measured 2026-08-31).
+# The modelslim_v1 pipeline uses PATTERN matching (not isinstance), which
+# reaches the fused parameters: externally verified artifact = 296GB,
+# 36,773 int8 tensors (attn + routed experts), 49% of BF16 source.
+#
+# Run via the v1 CLI:
+#   msmodelslim quant --model_path <BF16 dir> --save_path <out> \
+#     --device cpu --config_path glm53_flash_w8a8.yaml --quant_type w8a8
+#
+# Judged output (74 shards x ~4.3GB, TP8 = 37GB/card -> single 8x64GB node):
+#   int8: 36,773 tensors | f32: 73,546 scales/offsets | bf16: 998 (norm/embed/
+#   shared_experts/gate). Always re-verify with scripts/verify_quant_output.py.
+apiversion: modelslim_v1
+spec:
+  process:
+  - type: linear_quant
+    qconfig:
+      act:
+        scope: per_token
+        dtype: int8
+        symmetric: true
+        method: minmax
+      weight:
+        scope: per_channel
+        dtype: int8
+        symmetric: true
+        method: minmax
+    include:
+    - '*language_model.layers*.self_attn*'
+    exclude:
+    - '*indexer*'
+    - '*norm*'
+  - type: linear_quant
+    qconfig:
+      act:
+        scope: per_token
+        dtype: int8
+        symmetric: true
+        method: minmax
+      weight:
+        scope: per_channel
+        dtype: int8
+        symmetric: true
+        method: minmax
+    include:
+    - '*language_model.layers*.mlp*'
+    exclude:
+    - '*mlp.gate'
+    - '*shared_experts*'
