@@ -53,3 +53,19 @@
 - transformers 自带 `Glm5NextTextConfig` 无 `full_attention_layer_ids`；fork 属性只在 `_try_load_glm5_next_config`（`utils/hf_transformers/config.py`）替换 config 类后才有。容器外 AutoConfig 验证会误报 KeyError
 - `init_unified_mamba_pools` 看着正确（`len(full_attention_layer_ids)`）但生产 dispatch 走不到它——`use_mla + is_dsa` 优先命中 `_build_dsa_kv_pool`。**判池构成只信启动日志 `KV Cache is allocated` 实测数字反推**
 - OOM 后的 KV 损坏会以"暗号数字错一位"（7719→7791）形式出现，别误诊为池补丁 bug——先查 Error 日志有没有 207001
+
+## 0923 下午事故：视觉塔 swiglu @torch.compile 运行时重编译 → 跨机死锁（已修复）
+
+**现象**：服务运行 1h 后（07:35 UTC）全 rank 静默卡死，无任何 batch 日志，请求挂死或返回错误短响应；900s watchdog 16 rank 集体自杀，SIGQUIT 级联死透。
+
+**根因链**（py-spy + watchdog 栈实锤）：
+1. 首个带图像请求路由到 .34（DP1），vision tower `Glm5NextVisionMLP.forward` 首次走到 `swiglu_clamped`（`glm5_next.py:169`）
+2. 该函数带 `@torch.compile`（:138）——`server_args.enable_torch_compile=False` 管不到模块私有装饰器；`--skip-server-warmup` 又保证启动期无请求预热，视觉塔新 shape 首次触发 dynamo 编译
+3. torch_npu inductor `_make_launchers` 每核 `synchronize` 等 device 排空 ↔ device 队列里跨机 TP16 集合通信在等 .33（DP0）对齐 → 双向互等，硬死锁
+4. .33 侧表象：卡在 `dsa_indexer_kpool.py:189`（npu_lightning_indexer op launch，队列堵满）——indexer 是**受害者不是凶手**，别修错靶
+
+**修复**：`glm5_next.py` 的 swiglu_clamped 改为 `_swiglu_clamped_impl` + 条件编译（`_is_npu` 走 eager，GPU 才 compile）。.33 早在 09-15 就打过此补丁（当时因另一签名 `KeyError: s94+1 in detect_flattened_axis`），但只改了单节点副本——.34 仍是 @torch.compile 旧版，带图请求恰好分到 .34 引爆。
+
+**教训（制度化）**：sglang 源码是每节点 bind 各自的 `/data/models/mtp_experiment_0907/sglang`，无共享真值——**改源码必须两节点同改 + md5 对齐**（当前 `glm5_next.py = 79a1d3e1191a80f3246e2b5cab578f55`）。现役脚本唯一入口已归档 `/command/sglang-flash/recreate-w8a8moe-700k.sh`（旧版全部移入 `/command/old/sglang-flash-variants/`）。
+
+**判死要领**：跨机部署下"单节点 op 卡住"栈（indexer/通信 op launch）优先怀疑对端在编译或 GC——先 py-spy 对端，别急着改本端算子。
