@@ -69,3 +69,26 @@
 **教训（制度化）**：sglang 源码是每节点 bind 各自的 `/data/models/mtp_experiment_0907/sglang`，无共享真值——**改源码必须两节点同改 + md5 对齐**（当前 `glm5_next.py = 79a1d3e1191a80f3246e2b5cab578f55`）。现役脚本唯一入口已归档 `/command/sglang-flash/recreate-w8a8moe-700k.sh`（旧版全部移入 `/command/old/sglang-flash-variants/`）。
 
 **判死要领**：跨机部署下"单节点 op 卡住"栈（indexer/通信 op launch）优先怀疑对端在编译或 GC——先 py-spy 对端，别急着改本端算子。
+
+## 0923 晚定案：MoE int8 件长上下文循环病（BF16 对照铁证）
+
+**复现实验**（用户在原病灶会话直接 `/model` 切 BF16 端点重放——同对话同负载，唯一变量=权重精度）：
+
+| 变量 | v9 W8A8-MoE（int8 专家） | BF16 全量 |
+|---|---|---|
+| 同一 287K 上下文对话 | 循环重复相同 ls 调用、tool loop breaker 熔断、烧满预算 | **正常推进，无循环** |
+| 引擎侧 decode | 87-94 tok/s 表面健康 | 49-59 tok/s 健康 |
+| 228K 长上下文 prefill+decode | 进入循环态 | 正常完成（4462-4830 tok/s prefill） |
+
+**病灶会话特征**（loop-harness 教育/curriculum agent）：任务="通读项目给完整总结"，滚到 287K 后，模型在「读目录→等子代理→再读同一目录」低信息量闭环中失去跳出能力，同样 Bash 调用原样重复 25+ 次，每轮思考 1-2.5 分钟。
+
+**dtype 审计排除配置错误**（`verify_quant_output.py` + desc 扫描）：
+- 42 层×288 路由专家 int8（304GB，94%）——设计如此
+- 语义 router（.mlp.gate.weight 42 个）/ shared experts（126 张量）/ 注意力+KDA+indexer（596 张量）/ norm 全部 BF16 ✓
+- 结论：**不是量化了不该量化的模块，是 int8 专家本体在超长上下文下的误差累积**。42 层×每 forward 过 int8 专家，序列越长残差越大，最终在低信息量决策点失去跳出循环的判断力
+
+**修正旧结论**：0920「长任务 thinking 循环=模型固有病（三平台同款）」需要修正——当时 H800 BF16 对照未复现可能是负载/上下文长度不同；本次同对话同负载下 BF16 干净，长上下文循环病应记在 **int8 专家量化**头上（BF16 上开放生成烧预算的老病仍成立，见 glm53-flash-longtask-thinking-loop）。
+
+**生产决策（0923 定）**：正确性优先 → 生产切 BF16 TP16（池 900K token，40.2GB/卡权重，单流 decode 49-59 tok/s）。量化件保留给短上下文流量（≤150K，3 天生产+41 万 token 暗号检索全过）。后续方向：int8→BF16 逐层回退实验（若误差弥散则放弃）。
+
+**部署**：`serve-bf16-tp16-node.sh`（两节点 md5 8c22a53e）— BF16 642.6GB 120 分片全量验证、TP16、`--max-total-tokens 900000`、EAGLE draft 同款（layer45 本就 BF16 兼容）、其余参数与 w8a8moe-tp16 一致。容器 `glm53-bf16-tp16`，端口 8078 / 模型名 glm53-flash 不变（客户端 `/model` 热切）。
